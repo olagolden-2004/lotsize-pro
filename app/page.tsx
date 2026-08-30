@@ -488,6 +488,23 @@ export default function Home() {
               <span>%</span>
             </div>
           </Field>
+          <div className="riskPresets">
+  <button type="button" onClick={() => setRisk("0.5")}>
+    0.5%
+  </button>
+
+  <button type="button" onClick={() => setRisk("1")}>
+    1%
+  </button>
+
+  <button type="button" onClick={() => setRisk("1.5")}>
+    1.5%
+  </button>
+
+  <button type="button" onClick={() => setRisk("2")}>
+    2%
+  </button>
+</div>
         </div>
 
         <div className="sectionTitle">TRADE DIRECTION</div>
