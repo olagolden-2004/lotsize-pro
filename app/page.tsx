@@ -14,6 +14,7 @@ const forexPairs = [
   "USD/CHF",
   "NZD/USD",
   "EUR/GBP",
+  "EUR/JPY",
   "GBP/JPY",
 ];
 
@@ -26,18 +27,26 @@ export default function Home() {
   const [balance, setBalance] = useState("1000");
   const [risk, setRisk] = useState("1");
   const [direction, setDirection] = useState<Direction>("BUY");
+
   const [entry, setEntry] = useState("");
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
-  const [rewardRisk, setRewardRisk] = useState("");
+
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [updated, setUpdated] = useState("");
   const [loadingPrice, setLoadingPrice] = useState(false);
   const [priceError, setPriceError] = useState("");
+
   const [lotSize, setLotSize] = useState<number | null>(null);
-  const [riskMoney, setRiskMoney] = useState<number | null>(null);
+  const [targetRisk, setTargetRisk] = useState<number | null>(null);
+  const [actualRisk, setActualRisk] = useState<number | null>(null);
+  const [slDistance, setSlDistance] = useState<number | null>(null);
+  const [tpDistance, setTpDistance] = useState<number | null>(null);
+  const [riskReward, setRiskReward] = useState<number | null>(null);
   const [potentialProfit, setPotentialProfit] = useState<number | null>(null);
+
   const [error, setError] = useState("");
+  const [calculating, setCalculating] = useState(false);
 
   const symbol = mode === "gold" ? "XAU/USD" : pair;
 
@@ -47,7 +56,8 @@ export default function Home() {
 
     try {
       const response = await fetch(
-        `/api/quote?symbol=${encodeURIComponent(symbol)}`
+        `/api/quote?symbol=${encodeURIComponent(symbol)}`,
+        { cache: "no-store" }
       );
 
       const data = await response.json();
@@ -71,148 +81,293 @@ export default function Home() {
     setLivePrice(null);
     setUpdated("");
     setPriceError("");
+
     setLotSize(null);
-    setRiskMoney(null);
+    setTargetRisk(null);
+    setActualRisk(null);
+    setSlDistance(null);
+    setTpDistance(null);
+    setRiskReward(null);
     setPotentialProfit(null);
     setError("");
 
     getLivePrice();
   }, [symbol]);
 
-  function calculate() {
-    setError("");
+  function clearResults() {
     setLotSize(null);
-    setRiskMoney(null);
+    setTargetRisk(null);
+    setActualRisk(null);
+    setSlDistance(null);
+    setTpDistance(null);
+    setRiskReward(null);
     setPotentialProfit(null);
+  }
 
-    const balanceNumber = Number(balance);
-    const riskNumber = Number(risk);
-    const entryNumber = Number(entry);
-    const stopNumber = Number(stopLoss);
-    const tpNumber = Number(takeProfit);
+  async function getConversionRate(
+    fromCurrency: string,
+    toCurrency: string
+  ): Promise<number> {
+    if (fromCurrency === toCurrency) return 1;
 
-    if (
-      !Number.isFinite(balanceNumber) ||
-      balanceNumber <= 0 ||
-      !Number.isFinite(riskNumber) ||
-      riskNumber <= 0 ||
-      riskNumber > 100
-    ) {
-      setError("Enter a valid account balance and risk percentage.");
-      return;
+    const directSymbol = `${fromCurrency}/${toCurrency}`;
+
+    const directResponse = await fetch(
+      `/api/quote?symbol=${encodeURIComponent(directSymbol)}`,
+      { cache: "no-store" }
+    );
+
+    if (directResponse.ok) {
+      const directData = await directResponse.json();
+
+      if (directData.price && Number(directData.price) > 0) {
+        return Number(directData.price);
+      }
     }
 
-    if (!Number.isFinite(entryNumber) || entryNumber <= 0) {
-      setError("Enter a valid entry price.");
-      return;
+    const inverseSymbol = `${toCurrency}/${fromCurrency}`;
+
+    const inverseResponse = await fetch(
+      `/api/quote?symbol=${encodeURIComponent(inverseSymbol)}`,
+      { cache: "no-store" }
+    );
+
+    if (inverseResponse.ok) {
+      const inverseData = await inverseResponse.json();
+
+      if (inverseData.price && Number(inverseData.price) > 0) {
+        return 1 / Number(inverseData.price);
+      }
     }
 
-    if (!Number.isFinite(stopNumber) || stopNumber <= 0) {
-      setError("Enter a valid stop-loss price.");
-      return;
-    }
+    throw new Error(
+      `Unable to obtain ${fromCurrency}/${toCurrency} conversion rate.`
+    );
+  }
 
-    if (direction === "BUY" && stopNumber >= entryNumber) {
-      setError("For a BUY trade, Stop Loss must be below Entry.");
-      return;
-    }
+  async function calculate() {
+    setError("");
+    clearResults();
+    setCalculating(true);
 
-    if (direction === "SELL" && stopNumber <= entryNumber) {
-      setError("For a SELL trade, Stop Loss must be above Entry.");
-      return;
-    }
+    try {
+      const balanceNumber = Number(balance);
+      const riskNumber = Number(risk);
+      const entryNumber = Number(entry);
+      const stopNumber = Number(stopLoss);
+      const tpNumber = Number(takeProfit);
 
-    const moneyAtRisk = balanceNumber * (riskNumber / 100);
-    const distance = Math.abs(entryNumber - stopNumber);
+      if (!Number.isFinite(balanceNumber) || balanceNumber <= 0) {
+        throw new Error("Enter a valid account balance.");
+      }
 
-    let lots = 0;
+      if (
+        !Number.isFinite(riskNumber) ||
+        riskNumber <= 0 ||
+        riskNumber > 100
+      ) {
+        throw new Error("Risk percentage must be between 0.01% and 100%.");
+      }
 
-    if (mode === "gold") {
-      // XAUUSD: 1 standard lot = 100 troy ounces.
-      const riskPerLot = distance * 100;
-      lots = moneyAtRisk / riskPerLot;
-    } else {
-      const [base, quote] = pair.split("/");
+      if (!Number.isFinite(entryNumber) || entryNumber <= 0) {
+        throw new Error("Enter a valid entry price.");
+      }
 
-      // Pip size.
-      const pipSize = quote === "JPY" ? 0.01 : 0.0001;
+      if (!Number.isFinite(stopNumber) || stopNumber <= 0) {
+        throw new Error("Enter a valid stop-loss price.");
+      }
 
-      const pips = distance / pipSize;
+      if (direction === "BUY" && stopNumber >= entryNumber) {
+        throw new Error("For a BUY trade, Stop Loss must be below Entry.");
+      }
 
-      // Standard Forex contract: 100,000 base units.
-      // Pip value in quote currency for one standard lot.
-      const pipValueQuote = 100000 * pipSize;
+      if (direction === "SELL" && stopNumber <= entryNumber) {
+        throw new Error("For a SELL trade, Stop Loss must be above Entry.");
+      }
 
-      let conversion = 1;
+      const moneyAtRisk = balanceNumber * (riskNumber / 100);
+      const priceDistance = Math.abs(entryNumber - stopNumber);
 
-      if (accountCurrency !== quote) {
-        // The API route can supply a conversion rate.
-        // For now, the calculator requests it from the server.
-        // USD accounts on common USD-quoted pairs need no conversion.
-        if (quote === "USD" && accountCurrency === "USD") {
-          conversion = 1;
-        } else {
-          setError(
-            "This account currency requires a currency conversion rate. Use USD for this calculation for now."
+      if (priceDistance <= 0) {
+        throw new Error("Entry and Stop Loss cannot be the same price.");
+      }
+
+      let rawLots = 0;
+      let riskPerStandardLotInAccountCurrency = 0;
+
+      if (mode === "gold") {
+        /*
+          XAUUSD standard contract assumption:
+          1 standard lot = 100 troy ounces.
+
+          Profit/loss in USD:
+          price movement × 100 × lots
+        */
+
+        let usdToAccount = 1;
+
+        if (accountCurrency !== "USD") {
+          usdToAccount = await getConversionRate(
+            "USD",
+            accountCurrency
           );
-          return;
+        }
+
+        riskPerStandardLotInAccountCurrency =
+          priceDistance * 100 * usdToAccount;
+
+        rawLots = moneyAtRisk / riskPerStandardLotInAccountCurrency;
+      } else {
+        const [baseCurrency, quoteCurrency] = pair.split("/");
+
+        const pipSize = quoteCurrency === "JPY" ? 0.01 : 0.0001;
+
+        const pips = priceDistance / pipSize;
+
+        /*
+          Standard Forex contract:
+          1 standard lot = 100,000 base units.
+
+          Pip value in quote currency:
+          100,000 × pip size
+        */
+
+        const pipValueInQuoteCurrency = 100000 * pipSize;
+
+        let quoteToAccount = 1;
+
+        if (quoteCurrency !== accountCurrency) {
+          quoteToAccount = await getConversionRate(
+            quoteCurrency,
+            accountCurrency
+          );
+        }
+
+        riskPerStandardLotInAccountCurrency =
+          pips *
+          pipValueInQuoteCurrency *
+          quoteToAccount;
+
+        rawLots = moneyAtRisk / riskPerStandardLotInAccountCurrency;
+      }
+
+      if (!Number.isFinite(rawLots) || rawLots <= 0) {
+        throw new Error("Unable to calculate a valid lot size.");
+      }
+
+      /*
+        Round DOWN to the nearest 0.01 lot.
+
+        This prevents the calculator from recommending a position
+        that exceeds the trader's selected maximum risk.
+      */
+      const roundedLots =
+        Math.floor((rawLots + Number.EPSILON) * 100) / 100;
+
+      if (roundedLots < 0.01) {
+        throw new Error(
+          "The calculated lot size is below 0.01 lots. Your stop loss may be too large for the selected risk."
+        );
+      }
+
+      const actualRisk =
+        roundedLots * riskPerStandardLotInAccountCurrency;
+
+      const slPipsOrPoints =
+        mode === "gold"
+          ? priceDistance
+          : priceDistance /
+            (pair.split("/")[1] === "JPY" ? 0.01 : 0.0001);
+
+      let calculatedTpDistance: number | null = null;
+      let calculatedRR: number | null = null;
+      let profit: number | null = null;
+
+      if (Number.isFinite(tpNumber) && tpNumber > 0) {
+        if (direction === "BUY" && tpNumber <= entryNumber) {
+          throw new Error("For a BUY trade, Take Profit must be above Entry.");
+        }
+
+        if (direction === "SELL" && tpNumber >= entryNumber) {
+          throw new Error("For a SELL trade, Take Profit must be below Entry.");
+        }
+
+        calculatedTpDistance = Math.abs(tpNumber - entryNumber);
+
+        calculatedRR = calculatedTpDistance / priceDistance;
+
+        if (mode === "gold") {
+          let usdToAccount = 1;
+
+          if (accountCurrency !== "USD") {
+            usdToAccount = await getConversionRate(
+              "USD",
+              accountCurrency
+            );
+          }
+
+          profit =
+            calculatedTpDistance *
+            100 *
+            roundedLots *
+            usdToAccount;
+        } else {
+          const [, quoteCurrency] = pair.split("/");
+
+          const pipSize = quoteCurrency === "JPY" ? 0.01 : 0.0001;
+
+          const tpPips = calculatedTpDistance / pipSize;
+
+          const pipValueInQuoteCurrency = 100000 * pipSize;
+
+          let quoteToAccount = 1;
+
+          if (quoteCurrency !== accountCurrency) {
+            quoteToAccount = await getConversionRate(
+              quoteCurrency,
+              accountCurrency
+            );
+          }
+
+          profit =
+            tpPips *
+            pipValueInQuoteCurrency *
+            roundedLots *
+            quoteToAccount;
         }
       }
 
-      const riskPerLot = pips * pipValueQuote * conversion;
-      lots = moneyAtRisk / riskPerLot;
-    }
-
-    if (!Number.isFinite(lots) || lots <= 0) {
-      setError("Unable to calculate lot size from these values.");
-      return;
-    }
-
-    // Standard broker lot-step rounding.
-    const roundedLots = Math.floor(lots / 0.01) * 0.01;
-
-    if (roundedLots < 0.01) {
-      setError(
-        "The calculated lot size is below 0.01 lots. The position may be too large for the selected risk."
-      );
-      return;
-    }
-
-    setRiskMoney(moneyAtRisk);
-    setLotSize(roundedLots);
-
-    if (Number.isFinite(tpNumber) && tpNumber > 0) {
-      const tpDistance = Math.abs(tpNumber - entryNumber);
-
-      let profit = 0;
-
-      if (mode === "gold") {
-        profit = tpDistance * 100 * roundedLots;
-      } else {
-        const quote = pair.split("/")[1];
-        const pipSize = quote === "JPY" ? 0.01 : 0.0001;
-        const tpPips = tpDistance / pipSize;
-        const pipValue = 100000 * pipSize;
-        profit = tpPips * pipValue * roundedLots;
-      }
-
+      setLotSize(roundedLots);
+      setTargetRisk(moneyAtRisk);
+      setActualRisk(actualRisk);
+      setSlDistance(slPipsOrPoints);
+      setTpDistance(calculatedTpDistance);
+      setRiskReward(calculatedRR);
       setPotentialProfit(profit);
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Something went wrong while calculating."
+      );
+    } finally {
+      setCalculating(false);
     }
   }
 
   function reset() {
     setBalance("1000");
+    setAccountCurrency("USD");
     setRisk("1");
     setDirection("BUY");
     setEntry("");
     setStopLoss("");
     setTakeProfit("");
-    setRewardRisk("");
-    setLotSize(null);
-    setRiskMoney(null);
-    setPotentialProfit(null);
+    clearResults();
     setError("");
   }
+
+  const priceDecimals = mode === "gold" ? 2 : 5;
 
   return (
     <main className="page">
@@ -224,17 +379,21 @@ export default function Home() {
               Professional position-size calculator
             </div>
           </div>
-          <div className="liveBadge">LIVE</div>
+
+          <div className="liveBadge">● LIVE</div>
         </header>
 
         <div className="tabs">
           <button
+            type="button"
             className={mode === "forex" ? "tab active" : "tab"}
             onClick={() => setMode("forex")}
           >
             Forex
           </button>
+
           <button
+            type="button"
             className={mode === "gold" ? "tab active" : "tab"}
             onClick={() => setMode("gold")}
           >
@@ -245,28 +404,39 @@ export default function Home() {
         <div className="liveBox">
           <div>
             <span className="label">CURRENT MARKET PRICE</span>
+
             <strong>
               {loadingPrice
                 ? "Loading..."
                 : livePrice !== null
-                  ? livePrice.toFixed(mode === "gold" ? 2 : 5)
+                  ? livePrice.toFixed(priceDecimals)
                   : "—"}
             </strong>
+
+            {updated && <small>Updated {updated}</small>}
           </div>
 
-          <button className="refresh" onClick={getLivePrice}>
-            Refresh
+          <button
+            type="button"
+            className="refresh"
+            onClick={getLivePrice}
+            disabled={loadingPrice}
+          >
+            {loadingPrice ? "Loading" : "Refresh"}
           </button>
-
-          {updated && <small>Updated {updated}</small>}
         </div>
 
         {priceError && <div className="warning">{priceError}</div>}
 
+        <div className="sectionTitle">TRADE INFORMATION</div>
+
         <div className="grid">
           {mode === "forex" ? (
             <Field label="Currency Pair">
-              <select value={pair} onChange={(e) => setPair(e.target.value)}>
+              <select
+                value={pair}
+                onChange={(e) => setPair(e.target.value)}
+              >
                 {forexPairs.map((item) => (
                   <option key={item}>{item}</option>
                 ))}
@@ -274,17 +444,21 @@ export default function Home() {
             </Field>
           ) : (
             <div className="goldInfo">
-              <span>XAU/USD · Spot Gold</span>
-              <small>1.00 standard lot = 100 troy ounces</small>
+              <strong>XAU/USD · Spot Gold</strong>
+              <small>
+                Standard contract assumption: 1.00 lot = 100 troy ounces
+              </small>
             </div>
           )}
 
           <Field label="Account Balance">
             <input
+              type="number"
               inputMode="decimal"
               value={balance}
               onChange={(e) => setBalance(e.target.value)}
               placeholder="1000"
+              min="0"
             />
           </Field>
 
@@ -300,24 +474,35 @@ export default function Home() {
           </Field>
 
           <Field label="Risk Percentage">
-            <input
-              inputMode="decimal"
-              value={risk}
-              onChange={(e) => setRisk(e.target.value)}
-              placeholder="1"
-            />
-            <span className="suffix">%</span>
+            <div className="inputWithSuffix">
+              <input
+                type="number"
+                inputMode="decimal"
+                value={risk}
+                onChange={(e) => setRisk(e.target.value)}
+                placeholder="1"
+                min="0.01"
+                max="100"
+                step="0.01"
+              />
+              <span>%</span>
+            </div>
           </Field>
         </div>
 
+        <div className="sectionTitle">TRADE DIRECTION</div>
+
         <div className="direction">
           <button
+            type="button"
             className={direction === "BUY" ? "buy selected" : "buy"}
             onClick={() => setDirection("BUY")}
           >
             ↗ BUY
           </button>
+
           <button
+            type="button"
             className={direction === "SELL" ? "sell selected" : "sell"}
             onClick={() => setDirection("SELL")}
           >
@@ -325,49 +510,54 @@ export default function Home() {
           </button>
         </div>
 
+        <div className="sectionTitle">PRICE LEVELS</div>
+
         <div className="grid">
           <Field label="Entry Price">
             <input
+              type="number"
               inputMode="decimal"
               value={entry}
               onChange={(e) => setEntry(e.target.value)}
               placeholder={mode === "gold" ? "3400.00" : "1.35000"}
+              min="0"
             />
           </Field>
 
           <Field label="Stop Loss Price">
             <input
+              type="number"
               inputMode="decimal"
               value={stopLoss}
               onChange={(e) => setStopLoss(e.target.value)}
               placeholder={mode === "gold" ? "3390.00" : "1.34500"}
+              min="0"
             />
           </Field>
 
           <Field label="Take Profit" optional>
             <input
+              type="number"
               inputMode="decimal"
               value={takeProfit}
               onChange={(e) => setTakeProfit(e.target.value)}
               placeholder="Optional"
-            />
-          </Field>
-
-          <Field label="Reward : Risk" optional>
-            <input
-              inputMode="decimal"
-              value={rewardRisk}
-              onChange={(e) => setRewardRisk(e.target.value)}
-              placeholder="Optional"
+              min="0"
             />
           </Field>
         </div>
 
         <div className="buttons">
-          <button className="calculate" onClick={calculate}>
-            CALCULATE LOT SIZE
+          <button
+            type="button"
+            className="calculate"
+            onClick={calculate}
+            disabled={calculating}
+          >
+            {calculating ? "CALCULATING..." : "CALCULATE LOT SIZE"}
           </button>
-          <button className="reset" onClick={reset}>
+
+          <button type="button" className="reset" onClick={reset}>
             RESET
           </button>
         </div>
@@ -377,31 +567,85 @@ export default function Home() {
         {lotSize !== null && (
           <section className="result">
             <span className="resultLabel">RECOMMENDED LOT SIZE</span>
+
             <div className="lot">{lotSize.toFixed(2)}</div>
-            <div className="metrics">
-              <div>
-                <span>Amount at risk</span>
-                <strong>
-                  {riskMoney?.toFixed(2)} {accountCurrency}
-                </strong>
-              </div>
+
+            <div className="resultGrid">
+              <ResultItem
+                label="Target Risk"
+                value={`${targetRisk?.toFixed(2)} ${accountCurrency}`}
+              />
+
+              <ResultItem
+                label="Actual Risk"
+                value={`${actualRisk?.toFixed(2)} ${accountCurrency}`}
+              />
+
+              <ResultItem
+                label={
+                  mode === "gold"
+                    ? "SL Distance"
+                    : "SL Distance (pips)"
+                }
+                value={
+                  mode === "gold"
+                    ? `${slDistance?.toFixed(2)}`
+                    : `${slDistance?.toFixed(1)} pips`
+                }
+              />
+
+              {tpDistance !== null && (
+                <ResultItem
+                  label={
+                    mode === "gold"
+                      ? "TP Distance"
+                      : "TP Distance (pips)"
+                  }
+                  value={
+                    mode === "gold"
+                      ? `${tpDistance.toFixed(2)}`
+                      : `${tpDistance.toFixed(1)} pips`
+                  }
+                />
+              )}
+
+              {riskReward !== null && (
+                <ResultItem
+                  label="Risk : Reward"
+                  value={`1 : ${riskReward.toFixed(2)}`}
+                />
+              )}
 
               {potentialProfit !== null && (
-                <div>
-                  <span>Potential profit</span>
-                  <strong>
-                    {potentialProfit.toFixed(2)} {accountCurrency}
-                  </strong>
-                </div>
+                <ResultItem
+                  label="Potential Profit"
+                  value={`${potentialProfit.toFixed(2)} ${accountCurrency}`}
+                />
               )}
+            </div>
+
+            <div className="riskNote">
+              The lot size is rounded DOWN to the nearest 0.01 lot so the
+              recommended position does not intentionally exceed your selected
+              risk.
             </div>
           </section>
         )}
 
+        <div className="infoBox">
+          <strong>How LotSize Pro works</strong>
+          <p>
+            Enter your account balance, risk percentage, entry price and stop
+            loss. LotSize Pro calculates a position size based on the selected
+            instrument and risk.
+          </p>
+        </div>
+
         <p className="disclaimer">
-          LotSize Pro calculates position size from the information entered by
-          the trader. Always verify contract specifications, pip value, spread,
-          and broker lot limits before placing a trade.
+          This calculator is for educational and informational purposes.
+          Broker contract specifications, spreads, commissions, leverage,
+          minimum lot size and lot-step rules can vary. Always verify the
+          result with your broker before placing a trade.
         </p>
       </section>
 
@@ -509,6 +753,8 @@ export default function Home() {
         }
 
         .liveBox small {
+          display: block;
+          margin-top: 4px;
           color: #78909b;
           font-size: 11px;
         }
@@ -521,6 +767,19 @@ export default function Home() {
           background: #19323a;
           color: #27d1ce;
           font-weight: 700;
+        }
+
+        .refresh:disabled,
+        .calculate:disabled {
+          opacity: 0.6;
+        }
+
+        .sectionTitle {
+          margin: 18px 0 10px;
+          color: #78909b;
+          font-size: 10px;
+          font-weight: 800;
+          letter-spacing: 0.09em;
         }
 
         .grid {
@@ -560,10 +819,14 @@ export default function Home() {
           border-color: #27c9c7;
         }
 
-        .suffix {
+        .inputWithSuffix {
+          position: relative;
+        }
+
+        .inputWithSuffix span {
           position: absolute;
           right: 14px;
-          bottom: 16px;
+          top: 16px;
           color: #9baab1;
         }
 
@@ -571,7 +834,6 @@ export default function Home() {
           display: grid;
           grid-template-columns: 1fr 1fr;
           gap: 8px;
-          margin: 16px 0;
           padding: 5px;
           border-radius: 14px;
           background: #0b1419;
@@ -601,7 +863,7 @@ export default function Home() {
           display: grid;
           grid-template-columns: 1fr auto;
           gap: 8px;
-          margin-top: 18px;
+          margin-top: 20px;
         }
 
         .calculate {
@@ -633,32 +895,42 @@ export default function Home() {
         }
 
         .lot {
-          margin: 5px 0 14px;
+          margin: 5px 0 18px;
           font-size: 48px;
           font-weight: 900;
         }
 
-        .metrics {
+        .resultGrid {
           display: grid;
           grid-template-columns: 1fr 1fr;
           gap: 10px;
         }
 
-        .metrics div {
-          padding: 11px;
+        .resultItem {
+          padding: 12px;
           border-radius: 10px;
           background: #14242a;
+          text-align: left;
         }
 
-        .metrics span {
+        .resultItem span {
           display: block;
           color: #84959e;
-          font-size: 11px;
+          font-size: 10px;
         }
 
-        .metrics strong {
+        .resultItem strong {
           display: block;
-          margin-top: 4px;
+          margin-top: 5px;
+          color: #edf5f7;
+          font-size: 14px;
+        }
+
+        .riskNote {
+          margin-top: 12px;
+          color: #82939c;
+          font-size: 11px;
+          line-height: 1.5;
         }
 
         .warning,
@@ -667,6 +939,7 @@ export default function Home() {
           padding: 11px;
           border-radius: 10px;
           font-size: 13px;
+          line-height: 1.4;
         }
 
         .warning {
@@ -685,14 +958,35 @@ export default function Home() {
           padding: 14px;
           border-radius: 12px;
           background: #17252b;
-          font-weight: 800;
+        }
+
+        .goldInfo strong {
+          display: block;
         }
 
         .goldInfo small {
           display: block;
           margin-top: 5px;
           color: #84959e;
-          font-weight: 400;
+        }
+
+        .infoBox {
+          margin-top: 18px;
+          padding: 14px;
+          border: 1px solid #263b43;
+          border-radius: 12px;
+          background: #0d181d;
+        }
+
+        .infoBox strong {
+          font-size: 13px;
+        }
+
+        .infoBox p {
+          margin: 7px 0 0;
+          color: #82939c;
+          font-size: 12px;
+          line-height: 1.5;
         }
 
         .disclaimer {
@@ -719,6 +1013,10 @@ export default function Home() {
           .reset {
             min-height: 48px;
           }
+
+          .resultGrid {
+            grid-template-columns: 1fr 1fr;
+          }
         }
       `}</style>
     </main>
@@ -737,9 +1035,29 @@ function Field({
   return (
     <div className="field">
       <label>
-        {label} {optional && <span style={{ color: "#74858e" }}>optional</span>}
+        {label}{" "}
+        {optional && (
+          <span style={{ color: "#74858e", fontWeight: 400 }}>
+            optional
+          </span>
+        )}
       </label>
       {children}
+    </div>
+  );
+}
+
+function ResultItem({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="resultItem">
+      <span>{label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
