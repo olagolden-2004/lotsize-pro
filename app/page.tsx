@@ -602,10 +602,10 @@ export default function Home() {
                       : "TP Distance (pips)"
                   }
                   value={
-                    mode === "gold"
-                      ? `${tpDistance.toFixed(2)}`
-                      : `${tpDistance.toFixed(1)} pips`
-                  }
+  mode === "gold"
+    ? `${tpDistance.toFixed(2)}`
+    : `${(tpDistance / (pair.split("/")[1] === "JPY" ? 0.01 : 0.0001)).toFixed(1)} pips`
+}
                 />
               )}
 
