@@ -846,6 +846,28 @@ export default function Home() {
           top: 16px;
           color: #9baab1;
         }
+        .riskPresets {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.riskPresets button {
+  min-height: 34px;
+  border: 1px solid #34454e;
+  border-radius: 8px;
+  background: #17232a;
+  color: #aebbc2;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.riskPresets button:hover {
+  border-color: #27c9c7;
+  color: #27d1ce;
+  background: #123b40;
+}
 
         .direction {
           display: grid;
