@@ -20,6 +20,8 @@ const forexPairs = [
 
 const currencies = ["USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"];
 
+const lotSteps = ["0.01", "0.001", "0.1"];
+
 export default function Home() {
   const [mode, setMode] = useState<Mode>("forex");
   const [pair, setPair] = useState("GBP/USD");
@@ -32,12 +34,15 @@ export default function Home() {
   const [stopLoss, setStopLoss] = useState("");
   const [takeProfit, setTakeProfit] = useState("");
 
+  const [lotStep, setLotStep] = useState("0.01");
+
   const [livePrice, setLivePrice] = useState<number | null>(null);
   const [updated, setUpdated] = useState("");
   const [loadingPrice, setLoadingPrice] = useState(false);
   const [priceError, setPriceError] = useState("");
 
   const [lotSize, setLotSize] = useState<number | null>(null);
+  const [exactLotSize, setExactLotSize] = useState<number | null>(null);
   const [targetRisk, setTargetRisk] = useState<number | null>(null);
   const [actualRisk, setActualRisk] = useState<number | null>(null);
   const [slDistance, setSlDistance] = useState<number | null>(null);
@@ -82,13 +87,7 @@ export default function Home() {
     setUpdated("");
     setPriceError("");
 
-    setLotSize(null);
-    setTargetRisk(null);
-    setActualRisk(null);
-    setSlDistance(null);
-    setTpDistance(null);
-    setRiskReward(null);
-    setPotentialProfit(null);
+    clearResults();
     setError("");
 
     getLivePrice();
@@ -96,6 +95,7 @@ export default function Home() {
 
   function clearResults() {
     setLotSize(null);
+    setExactLotSize(null);
     setTargetRisk(null);
     setActualRisk(null);
     setSlDistance(null);
@@ -145,6 +145,10 @@ export default function Home() {
     );
   }
 
+  function roundDownToStep(value: number, step: number) {
+    return Math.floor((value + Number.EPSILON) / step) * step;
+  }
+
   async function calculate() {
     setError("");
     clearResults();
@@ -156,6 +160,7 @@ export default function Home() {
       const entryNumber = Number(entry);
       const stopNumber = Number(stopLoss);
       const tpNumber = Number(takeProfit);
+      const lotStepNumber = Number(lotStep);
 
       if (!Number.isFinite(balanceNumber) || balanceNumber <= 0) {
         throw new Error("Enter a valid account balance.");
@@ -192,16 +197,13 @@ export default function Home() {
         throw new Error("Entry and Stop Loss cannot be the same price.");
       }
 
-      let rawLots = 0;
+      let exactLots = 0;
       let riskPerStandardLotInAccountCurrency = 0;
 
       if (mode === "gold") {
         /*
           XAUUSD standard contract assumption:
           1 standard lot = 100 troy ounces.
-
-          Profit/loss in USD:
-          price movement × 100 × lots
         */
 
         let usdToAccount = 1;
@@ -216,23 +218,23 @@ export default function Home() {
         riskPerStandardLotInAccountCurrency =
           priceDistance * 100 * usdToAccount;
 
-        rawLots = moneyAtRisk / riskPerStandardLotInAccountCurrency;
+        exactLots =
+          moneyAtRisk / riskPerStandardLotInAccountCurrency;
       } else {
-        const [baseCurrency, quoteCurrency] = pair.split("/");
+        const [, quoteCurrency] = pair.split("/");
 
-        const pipSize = quoteCurrency === "JPY" ? 0.01 : 0.0001;
+        const pipSize =
+          quoteCurrency === "JPY" ? 0.01 : 0.0001;
 
         const pips = priceDistance / pipSize;
 
         /*
           Standard Forex contract:
-          1 standard lot = 100,000 base units.
-
-          Pip value in quote currency:
-          100,000 × pip size
+          1 standard lot = 100,000 units.
         */
 
-        const pipValueInQuoteCurrency = 100000 * pipSize;
+        const pipValueInQuoteCurrency =
+          100000 * pipSize;
 
         let quoteToAccount = 1;
 
@@ -248,98 +250,140 @@ export default function Home() {
           pipValueInQuoteCurrency *
           quoteToAccount;
 
-        rawLots = moneyAtRisk / riskPerStandardLotInAccountCurrency;
+        exactLots =
+          moneyAtRisk /
+          riskPerStandardLotInAccountCurrency;
       }
 
-      if (!Number.isFinite(rawLots) || rawLots <= 0) {
+      if (!Number.isFinite(exactLots) || exactLots <= 0) {
         throw new Error("Unable to calculate a valid lot size.");
       }
 
       /*
-        Round DOWN to the nearest 0.01 lot.
+        IMPORTANT:
 
-        This prevents the calculator from recommending a position
-        that exceeds the trader's selected maximum risk.
+        exactLots = mathematically correct position size.
+
+        brokerLots = position size rounded DOWN according
+        to the selected broker lot step.
+
+        Rounding DOWN prevents the recommended position
+        from exceeding the selected maximum risk.
       */
-      const roundedLots =
-        Math.floor((rawLots + Number.EPSILON) * 100) / 100;
 
-      if (roundedLots < 0.01) {
+      const brokerLots = roundDownToStep(
+        exactLots,
+        lotStepNumber
+      );
+
+      const cleanedBrokerLots =
+        Number(brokerLots.toFixed(3));
+
+      if (cleanedBrokerLots < lotStepNumber) {
         throw new Error(
-          "The calculated lot size is below 0.01 lots. Your stop loss may be too large for the selected risk."
+          `The calculated lot size is below the selected ${lotStep} lot step. Your stop loss may be too large for the selected risk.`
         );
       }
 
-      const actualRisk =
-        roundedLots * riskPerStandardLotInAccountCurrency;
+      const calculatedActualRisk =
+        cleanedBrokerLots *
+        riskPerStandardLotInAccountCurrency;
 
       const slPipsOrPoints =
         mode === "gold"
           ? priceDistance
           : priceDistance /
-            (pair.split("/")[1] === "JPY" ? 0.01 : 0.0001);
+            (pair.split("/")[1] === "JPY"
+              ? 0.01
+              : 0.0001);
 
       let calculatedTpDistance: number | null = null;
       let calculatedRR: number | null = null;
       let profit: number | null = null;
 
-      if (Number.isFinite(tpNumber) && tpNumber > 0) {
-        if (direction === "BUY" && tpNumber <= entryNumber) {
-          throw new Error("For a BUY trade, Take Profit must be above Entry.");
+      if (
+        Number.isFinite(tpNumber) &&
+        tpNumber > 0
+      ) {
+        if (
+          direction === "BUY" &&
+          tpNumber <= entryNumber
+        ) {
+          throw new Error(
+            "For a BUY trade, Take Profit must be above Entry."
+          );
         }
 
-        if (direction === "SELL" && tpNumber >= entryNumber) {
-          throw new Error("For a SELL trade, Take Profit must be below Entry.");
+        if (
+          direction === "SELL" &&
+          tpNumber >= entryNumber
+        ) {
+          throw new Error(
+            "For a SELL trade, Take Profit must be below Entry."
+          );
         }
 
-        calculatedTpDistance = Math.abs(tpNumber - entryNumber);
+        calculatedTpDistance =
+          Math.abs(tpNumber - entryNumber);
 
-        calculatedRR = calculatedTpDistance / priceDistance;
+        calculatedRR =
+          calculatedTpDistance / priceDistance;
 
         if (mode === "gold") {
           let usdToAccount = 1;
 
           if (accountCurrency !== "USD") {
-            usdToAccount = await getConversionRate(
-              "USD",
-              accountCurrency
-            );
+            usdToAccount =
+              await getConversionRate(
+                "USD",
+                accountCurrency
+              );
           }
 
           profit =
             calculatedTpDistance *
             100 *
-            roundedLots *
+            cleanedBrokerLots *
             usdToAccount;
         } else {
-          const [, quoteCurrency] = pair.split("/");
+          const [, quoteCurrency] =
+            pair.split("/");
 
-          const pipSize = quoteCurrency === "JPY" ? 0.01 : 0.0001;
+          const pipSize =
+            quoteCurrency === "JPY"
+              ? 0.01
+              : 0.0001;
 
-          const tpPips = calculatedTpDistance / pipSize;
+          const tpPips =
+            calculatedTpDistance / pipSize;
 
-          const pipValueInQuoteCurrency = 100000 * pipSize;
+          const pipValueInQuoteCurrency =
+            100000 * pipSize;
 
           let quoteToAccount = 1;
 
-          if (quoteCurrency !== accountCurrency) {
-            quoteToAccount = await getConversionRate(
-              quoteCurrency,
-              accountCurrency
-            );
+          if (
+            quoteCurrency !== accountCurrency
+          ) {
+            quoteToAccount =
+              await getConversionRate(
+                quoteCurrency,
+                accountCurrency
+              );
           }
 
           profit =
             tpPips *
             pipValueInQuoteCurrency *
-            roundedLots *
+            cleanedBrokerLots *
             quoteToAccount;
         }
       }
 
-      setLotSize(roundedLots);
+      setExactLotSize(exactLots);
+      setLotSize(cleanedBrokerLots);
       setTargetRisk(moneyAtRisk);
-      setActualRisk(actualRisk);
+      setActualRisk(calculatedActualRisk);
       setSlDistance(slPipsOrPoints);
       setTpDistance(calculatedTpDistance);
       setRiskReward(calculatedRR);
@@ -363,39 +407,58 @@ export default function Home() {
     setEntry("");
     setStopLoss("");
     setTakeProfit("");
+    setLotStep("0.01");
     clearResults();
     setError("");
   }
 
-  const priceDecimals = mode === "gold" ? 2 : 5;
+  const priceDecimals =
+    mode === "gold" ? 2 : 5;
 
   return (
     <main className="page">
       <section className="card">
         <header className="header">
           <div>
-            <div className="brand">LotSize Pro</div>
+            <div className="brand">
+              LotSize Pro
+            </div>
+
             <div className="subtitle">
               Professional position-size calculator
             </div>
           </div>
 
-          <div className="liveBadge">● LIVE</div>
+          <div className="liveBadge">
+            ● LIVE
+          </div>
         </header>
 
         <div className="tabs">
           <button
             type="button"
-            className={mode === "forex" ? "tab active" : "tab"}
-            onClick={() => setMode("forex")}
+            className={
+              mode === "forex"
+                ? "tab active"
+                : "tab"
+            }
+            onClick={() =>
+              setMode("forex")
+            }
           >
             Forex
           </button>
 
           <button
             type="button"
-            className={mode === "gold" ? "tab active" : "tab"}
-            onClick={() => setMode("gold")}
+            className={
+              mode === "gold"
+                ? "tab active"
+                : "tab"
+            }
+            onClick={() =>
+              setMode("gold")
+            }
           >
             Gold · XAUUSD
           </button>
@@ -403,17 +466,25 @@ export default function Home() {
 
         <div className="liveBox">
           <div>
-            <span className="label">CURRENT MARKET PRICE</span>
+            <span className="label">
+              CURRENT MARKET PRICE
+            </span>
 
             <strong>
               {loadingPrice
                 ? "Loading..."
                 : livePrice !== null
-                  ? livePrice.toFixed(priceDecimals)
+                  ? livePrice.toFixed(
+                      priceDecimals
+                    )
                   : "—"}
             </strong>
 
-            {updated && <small>Updated {updated}</small>}
+            {updated && (
+              <small>
+                Updated {updated}
+              </small>
+            )}
           </div>
 
           <button
@@ -422,31 +493,49 @@ export default function Home() {
             onClick={getLivePrice}
             disabled={loadingPrice}
           >
-            {loadingPrice ? "Loading" : "Refresh"}
+            {loadingPrice
+              ? "Loading"
+              : "Refresh"}
           </button>
         </div>
 
-        {priceError && <div className="warning">{priceError}</div>}
+        {priceError && (
+          <div className="warning">
+            {priceError}
+          </div>
+        )}
 
-        <div className="sectionTitle">TRADE INFORMATION</div>
+        <div className="sectionTitle">
+          TRADE INFORMATION
+        </div>
 
         <div className="grid">
           {mode === "forex" ? (
             <Field label="Currency Pair">
               <select
                 value={pair}
-                onChange={(e) => setPair(e.target.value)}
+                onChange={(e) =>
+                  setPair(e.target.value)
+                }
               >
-                {forexPairs.map((item) => (
-                  <option key={item}>{item}</option>
-                ))}
+                {forexPairs.map(
+                  (item) => (
+                    <option key={item}>
+                      {item}
+                    </option>
+                  )
+                )}
               </select>
             </Field>
           ) : (
             <div className="goldInfo">
-              <strong>XAU/USD · Spot Gold</strong>
+              <strong>
+                XAU/USD · Spot Gold
+              </strong>
+
               <small>
-                Standard contract assumption: 1.00 lot = 100 troy ounces
+                Standard contract assumption:
+                1.00 lot = 100 troy ounces
               </small>
             </div>
           )}
@@ -456,7 +545,9 @@ export default function Home() {
               type="number"
               inputMode="decimal"
               value={balance}
-              onChange={(e) => setBalance(e.target.value)}
+              onChange={(e) =>
+                setBalance(e.target.value)
+              }
               placeholder="1000"
               min="0"
             />
@@ -465,11 +556,19 @@ export default function Home() {
           <Field label="Account Currency">
             <select
               value={accountCurrency}
-              onChange={(e) => setAccountCurrency(e.target.value)}
+              onChange={(e) =>
+                setAccountCurrency(
+                  e.target.value
+                )
+              }
             >
-              {currencies.map((currency) => (
-                <option key={currency}>{currency}</option>
-              ))}
+              {currencies.map(
+                (currency) => (
+                  <option key={currency}>
+                    {currency}
+                  </option>
+                )
+              )}
             </select>
           </Field>
 
@@ -479,55 +578,125 @@ export default function Home() {
                 type="number"
                 inputMode="decimal"
                 value={risk}
-                onChange={(e) => setRisk(e.target.value)}
+                onChange={(e) =>
+                  setRisk(e.target.value)
+                }
                 placeholder="1"
                 min="0.01"
                 max="100"
                 step="0.01"
               />
+
               <span>%</span>
             </div>
           </Field>
+
           <div className="riskPresets">
-  <button type="button" onClick={() => setRisk("0.5")}>
-    0.5%
-  </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRisk("0.5")
+              }
+            >
+              0.5%
+            </button>
 
-  <button type="button" onClick={() => setRisk("1")}>
-    1%
-  </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRisk("1")
+              }
+            >
+              1%
+            </button>
 
-  <button type="button" onClick={() => setRisk("1.5")}>
-    1.5%
-  </button>
+            <button
+              type="button"
+              onClick={() =>
+                setRisk("1.5")
+              }
+            >
+              1.5%
+            </button>
 
-  <button type="button" onClick={() => setRisk("2")}>
-    2%
-  </button>
-</div>
+            <button
+              type="button"
+              onClick={() =>
+                setRisk("2")
+              }
+            >
+              2%
+            </button>
+          </div>
+
+          <Field label="Broker Lot Step">
+            <select
+              value={lotStep}
+              onChange={(e) =>
+                setLotStep(e.target.value)
+              }
+            >
+              {lotSteps.map((step) => (
+                <option
+                  key={step}
+                  value={step}
+                >
+                  {step} lot
+                </option>
+              ))}
+            </select>
+          </Field>
         </div>
 
-        <div className="sectionTitle">TRADE DIRECTION</div>
+        <div className="lotStepInfo">
+          <strong>
+            Broker lot step
+          </strong>
+
+          <span>
+            Choose the smallest lot increment
+            your broker allows. Most brokers
+            use 0.01.
+          </span>
+        </div>
+
+        <div className="sectionTitle">
+          TRADE DIRECTION
+        </div>
 
         <div className="direction">
           <button
             type="button"
-            className={direction === "BUY" ? "buy selected" : "buy"}
-            onClick={() => setDirection("BUY")}
+            className={
+              direction === "BUY"
+                ? "buy selected"
+                : "buy"
+            }
+            onClick={() =>
+              setDirection("BUY")
+            }
           >
             ↗ BUY
           </button>
 
           <button
             type="button"
-            className={direction === "SELL" ? "sell selected" : "sell"}
-            onClick={() => setDirection("SELL")}
+            className={
+              direction === "SELL"
+                ? "sell selected"
+                : "sell"
+            }
+            onClick={() =>
+              setDirection("SELL")
+            }
           >
             ↘ SELL
           </button>
         </div>
 
-        <div className="sectionTitle">PRICE LEVELS</div>
+        <div className="sectionTitle">
+          PRICE LEVELS
+        </div>
 
         <div className="grid">
           <Field label="Entry Price">
@@ -535,8 +704,14 @@ export default function Home() {
               type="number"
               inputMode="decimal"
               value={entry}
-              onChange={(e) => setEntry(e.target.value)}
-              placeholder={mode === "gold" ? "3400.00" : "1.35000"}
+              onChange={(e) =>
+                setEntry(e.target.value)
+              }
+              placeholder={
+                mode === "gold"
+                  ? "3400.00"
+                  : "1.35000"
+              }
               min="0"
             />
           </Field>
@@ -546,18 +721,31 @@ export default function Home() {
               type="number"
               inputMode="decimal"
               value={stopLoss}
-              onChange={(e) => setStopLoss(e.target.value)}
-              placeholder={mode === "gold" ? "3390.00" : "1.34500"}
+              onChange={(e) =>
+                setStopLoss(e.target.value)
+              }
+              placeholder={
+                mode === "gold"
+                  ? "3390.00"
+                  : "1.34500"
+              }
               min="0"
             />
           </Field>
 
-          <Field label="Take Profit" optional>
+          <Field
+            label="Take Profit"
+            optional
+          >
             <input
               type="number"
               inputMode="decimal"
               value={takeProfit}
-              onChange={(e) => setTakeProfit(e.target.value)}
+              onChange={(e) =>
+                setTakeProfit(
+                  e.target.value
+                )
+              }
               placeholder="Optional"
               min="0"
             />
@@ -571,31 +759,69 @@ export default function Home() {
             onClick={calculate}
             disabled={calculating}
           >
-            {calculating ? "CALCULATING..." : "CALCULATE LOT SIZE"}
+            {calculating
+              ? "CALCULATING..."
+              : "CALCULATE LOT SIZE"}
           </button>
 
-          <button type="button" className="reset" onClick={reset}>
+          <button
+            type="button"
+            className="reset"
+            onClick={reset}
+          >
             RESET
           </button>
         </div>
 
-        {error && <div className="error">{error}</div>}
+        {error && (
+          <div className="error">
+            {error}
+          </div>
+        )}
 
         {lotSize !== null && (
           <section className="result">
-            <span className="resultLabel">RECOMMENDED LOT SIZE</span>
+            <span className="resultLabel">
+              BROKER-READY LOT SIZE
+            </span>
 
-            <div className="lot">{lotSize.toFixed(2)}</div>
+            <div className="lot">
+              {lotSize.toFixed(
+                Number(lotStep) >= 0.1
+                  ? 1
+                  : Number(lotStep) >= 0.01
+                    ? 2
+                    : 3
+              )}
+            </div>
+
+            {exactLotSize !== null && (
+              <div className="exactLotBox">
+                <span>
+                  EXACT CALCULATED LOT
+                </span>
+
+                <strong>
+                  {exactLotSize.toFixed(
+                    4
+                  )}
+                </strong>
+              </div>
+            )}
 
             <div className="resultGrid">
               <ResultItem
                 label="Target Risk"
-                value={`${targetRisk?.toFixed(2)} ${accountCurrency}`}
+                value={`${targetRisk?.toFixed(
+                  2
+                )} ${accountCurrency}`}
               />
 
               <ResultItem
                 label="Actual Risk"
-                value={`${actualRisk?.toFixed(2)} ${accountCurrency}`}
+                value={`${actualRisk?.toFixed(
+                  2
+                )} ${accountCurrency}`}
               />
 
               <ResultItem
@@ -606,8 +832,12 @@ export default function Home() {
                 }
                 value={
                   mode === "gold"
-                    ? `${slDistance?.toFixed(2)}`
-                    : `${slDistance?.toFixed(1)} pips`
+                    ? `${slDistance?.toFixed(
+                        2
+                      )}`
+                    : `${slDistance?.toFixed(
+                        1
+                      )} pips`
                 }
               />
 
@@ -619,50 +849,87 @@ export default function Home() {
                       : "TP Distance (pips)"
                   }
                   value={
-  mode === "gold"
-    ? `${tpDistance.toFixed(2)}`
-    : `${(tpDistance / (pair.split("/")[1] === "JPY" ? 0.01 : 0.0001)).toFixed(1)} pips`
-}
+                    mode === "gold"
+                      ? `${tpDistance.toFixed(
+                          2
+                        )}`
+                      : `${(
+                          tpDistance /
+                          (pair.split(
+                            "/"
+                          )[1] === "JPY"
+                            ? 0.01
+                            : 0.0001)
+                        ).toFixed(1)} pips`
+                  }
                 />
               )}
 
               {riskReward !== null && (
                 <ResultItem
                   label="Risk : Reward"
-                  value={`1 : ${riskReward.toFixed(2)}`}
+                  value={`1 : ${riskReward.toFixed(
+                    2
+                  )}`}
                 />
               )}
 
               {potentialProfit !== null && (
                 <ResultItem
                   label="Potential Profit"
-                  value={`${potentialProfit.toFixed(2)} ${accountCurrency}`}
+                  value={`${potentialProfit.toFixed(
+                    2
+                  )} ${accountCurrency}`}
                 />
               )}
             </div>
 
             <div className="riskNote">
-              The lot size is rounded DOWN to the nearest 0.01 lot so the
-              recommended position does not intentionally exceed your selected
+              <strong>
+                Why are the two lot sizes
+                different?
+              </strong>
+
+              <br />
+
+              The exact lot size is the
+              mathematical position size required
+              to reach your selected risk.
+
+              <br />
+              <br />
+
+              The broker-ready lot size is rounded
+              DOWN to your selected broker lot step,
+              so the recommended position does not
+              intentionally exceed your maximum
               risk.
             </div>
           </section>
         )}
 
         <div className="infoBox">
-          <strong>How LotSize Pro works</strong>
+          <strong>
+            How LotSize Pro works
+          </strong>
+
           <p>
-            Enter your account balance, risk percentage, entry price and stop
-            loss. LotSize Pro calculates a position size based on the selected
-            instrument and risk.
+            Enter your account balance, risk
+            percentage, entry price and stop loss.
+            LotSize Pro calculates the exact
+            mathematical position size and then
+            adjusts it to the lot increment your
+            broker supports.
           </p>
         </div>
 
         <p className="disclaimer">
-          This calculator is for educational and informational purposes.
-          Broker contract specifications, spreads, commissions, leverage,
-          minimum lot size and lot-step rules can vary. Always verify the
-          result with your broker before placing a trade.
+          This calculator is for educational and
+          informational purposes. Broker contract
+          specifications, spreads, commissions,
+          leverage, minimum lot size and lot-step
+          rules can vary. Always verify the result
+          with your broker before placing a trade.
         </p>
       </section>
 
@@ -691,7 +958,9 @@ export default function Home() {
           border: 1px solid #26343d;
           border-radius: 20px;
           background: #101a20;
-          box-shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
+          box-shadow:
+            0 20px 60px
+            rgba(0, 0, 0, 0.35);
         }
 
         .header {
@@ -846,28 +1115,51 @@ export default function Home() {
           top: 16px;
           color: #9baab1;
         }
+
         .riskPresets {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 6px;
-  margin-top: 7px;
-}
+          display: grid;
+          grid-template-columns:
+            repeat(4, 1fr);
+          gap: 6px;
+          margin-top: 7px;
+        }
 
-.riskPresets button {
-  min-height: 34px;
-  border: 1px solid #34454e;
-  border-radius: 8px;
-  background: #17232a;
-  color: #aebbc2;
-  font-size: 12px;
-  font-weight: 700;
-}
+        .riskPresets button {
+          min-height: 34px;
+          border: 1px solid #34454e;
+          border-radius: 8px;
+          background: #17232a;
+          color: #aebbc2;
+          font-size: 12px;
+          font-weight: 700;
+        }
 
-.riskPresets button:hover {
-  border-color: #27c9c7;
-  color: #27d1ce;
-  background: #123b40;
-}
+        .riskPresets button:hover {
+          border-color: #27c9c7;
+          color: #27d1ce;
+          background: #123b40;
+        }
+
+        .lotStepInfo {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+          margin-top: 4px;
+          padding: 11px 13px;
+          border-radius: 10px;
+          background: #0c171c;
+        }
+
+        .lotStepInfo strong {
+          font-size: 11px;
+          color: #b9c8ce;
+        }
+
+        .lotStepInfo span {
+          color: #74858e;
+          font-size: 11px;
+          line-height: 1.4;
+        }
 
         .direction {
           display: grid;
@@ -934,9 +1226,31 @@ export default function Home() {
         }
 
         .lot {
-          margin: 5px 0 18px;
+          margin: 5px 0 15px;
           font-size: 48px;
           font-weight: 900;
+        }
+
+        .exactLotBox {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          margin-bottom: 12px;
+          padding: 11px 13px;
+          border-radius: 10px;
+          background: #14242a;
+          text-align: left;
+        }
+
+        .exactLotBox span {
+          color: #84959e;
+          font-size: 10px;
+          font-weight: 700;
+        }
+
+        .exactLotBox strong {
+          color: #27d1ce;
+          font-size: 15px;
         }
 
         .resultGrid {
@@ -970,6 +1284,11 @@ export default function Home() {
           color: #82939c;
           font-size: 11px;
           line-height: 1.5;
+          text-align: left;
+        }
+
+        .riskNote strong {
+          color: #c4d1d6;
         }
 
         .warning,
@@ -1076,11 +1395,17 @@ function Field({
       <label>
         {label}{" "}
         {optional && (
-          <span style={{ color: "#74858e", fontWeight: 400 }}>
+          <span
+            style={{
+              color: "#74858e",
+              fontWeight: 400,
+            }}
+          >
             optional
           </span>
         )}
       </label>
+
       {children}
     </div>
   );
@@ -1099,4 +1424,4 @@ function ResultItem({
       <strong>{value}</strong>
     </div>
   );
-}
+  }
